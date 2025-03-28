@@ -49,15 +49,10 @@ use std::{
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
-use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, RefreshKind};
 use tokio::{runtime::Runtime, sync::broadcast};
 use tracking::TrackingManager;
 
 static FILESYSTEM_LAYOUT: OnceLock<afs::Layout> = OnceLock::new();
-
-pub fn initialize_environment(layout: afs::Layout) {
-    FILESYSTEM_LAYOUT.set(layout).unwrap();
-}
 
 // This is lazily initialized when initializing logging or ServerCoreContext. So FILESYSTEM_LAYOUT
 // needs to be initialized first using initialize_environment().
@@ -68,6 +63,13 @@ static SESSION_MANAGER: Lazy<RwLock<ServerSessionManager>> = Lazy::new(|| {
         FILESYSTEM_LAYOUT.get().map(|l| l.session()),
     ))
 });
+
+pub fn initialize_environment(layout: afs::Layout) {
+    FILESYSTEM_LAYOUT.set(layout).unwrap();
+
+    // This ensures that the session is written to disk
+    SESSION_MANAGER.write().session_mut();
+}
 
 // todo: use this as the network packet
 pub struct ViewsConfig {
@@ -144,12 +146,7 @@ pub fn create_recording_file(connection_context: &ConnectionContext, settings: &
 }
 
 pub fn notify_restart_driver() {
-    let mut system = sysinfo::System::new_with_specifics(
-        RefreshKind::new().with_processes(ProcessRefreshKind::everything()),
-    );
-    system.refresh_processes(ProcessesToUpdate::All);
-
-    if system
+    if sysinfo::System::new_all()
         .processes_by_name(OsStr::new(&afs::dashboard_fname()))
         .next()
         .is_some()
@@ -560,12 +557,6 @@ impl Drop for ServerCoreContext {
             let mut session_manager_lock = SESSION_MANAGER.write();
             session_manager_lock.session_mut().openvr_config =
                 connection::contruct_openvr_config(session_manager_lock.session());
-        }
-
-        dbg_server_core!("Restore drivers registration backup");
-        if let Some(backup) = SESSION_MANAGER.write().session_mut().drivers_backup.take() {
-            alvr_server_io::driver_registration(&backup.other_paths, true).ok();
-            alvr_server_io::driver_registration(&[backup.alvr_path], false).ok();
         }
 
         // todo: check if this is still needed

@@ -3,40 +3,38 @@ mod linux_steamvr;
 #[cfg(windows)]
 mod windows_steamvr;
 
-use crate::data_sources;
-use alvr_common::{debug, glam::bool, once_cell::sync::Lazy, parking_lot::Mutex};
+use alvr_common::{
+    anyhow::{Context, Result},
+    debug,
+    glam::bool,
+    once_cell::sync::Lazy,
+    parking_lot::Mutex,
+    warn,
+};
 use alvr_filesystem as afs;
-use alvr_session::{DriverLaunchAction, DriversBackup};
+use serde_json::{self, json};
 use std::{
-    env,
     ffi::OsStr,
+    fs,
     marker::PhantomData,
     thread,
     time::{Duration, Instant},
 };
-use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System};
+use sysinfo::{ProcessesToUpdate, System};
 
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
+const DRIVER_KEY: &str = "driver_alvr_server";
+const BLOCKED_KEY: &str = "blocked_by_safe_mode";
 
 pub fn is_steamvr_running() -> bool {
-    let mut system = System::new_with_specifics(
-        RefreshKind::new().with_processes(ProcessRefreshKind::everything()),
-    );
-    system.refresh_processes(ProcessesToUpdate::All);
-
-    system
+    System::new_all()
         .processes_by_name(OsStr::new(&afs::exec_fname("vrserver")))
         .count()
         != 0
 }
 
 pub fn maybe_kill_steamvr() {
-    let mut system = System::new_with_specifics(
-        RefreshKind::new().with_processes(ProcessRefreshKind::everything()),
-    );
-    system.refresh_processes(ProcessesToUpdate::All);
-
-    // first kill vrmonitor, then kill vrserver if it is hung.
+    let mut system = System::new_all();
 
     #[allow(unused_variables)]
     for process in system.processes_by_name(OsStr::new(&afs::exec_fname("vrmonitor"))) {
@@ -50,7 +48,7 @@ pub fn maybe_kill_steamvr() {
         thread::sleep(Duration::from_secs(1));
     }
 
-    system.refresh_processes(ProcessesToUpdate::All);
+    system.refresh_processes(ProcessesToUpdate::All, true);
 
     #[allow(unused_variables)]
     for process in system.processes_by_name(OsStr::new(&afs::exec_fname("vrserver"))) {
@@ -65,6 +63,49 @@ pub fn maybe_kill_steamvr() {
     }
 }
 
+fn unblock_alvr_driver() -> Result<()> {
+    if !cfg!(target_os = "linux") {
+        return Ok(());
+    }
+
+    let path = alvr_server_io::steamvr_settings_file_path()?;
+    let text = fs::read_to_string(&path).with_context(|| format!("Failed to read {:?}", path))?;
+    let new_text = unblock_alvr_driver_within_vrsettings(text.as_str())
+        .with_context(|| "Failed to rewrite .vrsettings.")?;
+    fs::write(&path, new_text)
+        .with_context(|| "Failed to write .vrsettings back after changing it.")?;
+    Ok(())
+}
+
+// Reads and writes back steamvr.vrsettings in order to
+// ensure the ALVR driver is not blocked (safe mode).
+fn unblock_alvr_driver_within_vrsettings(text: &str) -> Result<String> {
+    let mut settings = serde_json::from_str::<serde_json::Value>(text)?;
+    let values = settings
+        .as_object_mut()
+        .with_context(|| "Failed to parse .vrsettings.")?;
+    let blocked = values
+        .get(DRIVER_KEY)
+        .and_then(|driver| driver.get(BLOCKED_KEY))
+        .and_then(|blocked| blocked.as_bool())
+        .unwrap_or(false);
+
+    if blocked {
+        debug!("Unblocking ALVR driver in SteamVR.");
+        if !values.contains_key(DRIVER_KEY) {
+            values.insert(DRIVER_KEY.into(), json!({}));
+        }
+        let driver = settings[DRIVER_KEY]
+            .as_object_mut()
+            .with_context(|| "Did not find ALVR key in settings.")?;
+        driver.insert(BLOCKED_KEY.into(), json!(false)); // overwrites if present
+    } else {
+        debug!("ALVR is not blocked in SteamVR.");
+    }
+
+    Ok(serde_json::to_string_pretty(&settings)?)
+}
+
 pub struct Launcher {
     _phantom: PhantomData<()>,
 }
@@ -74,38 +115,22 @@ impl Launcher {
         #[cfg(target_os = "linux")]
         linux_steamvr::linux_hardware_checks();
 
-        let mut data_source = data_sources::get_local_session_source();
+        let alvr_driver_dir = crate::get_filesystem_layout().openvr_driver_root_dir;
 
-        let launch_action = &data_source
-            .settings()
-            .extra
-            .steamvr_launcher
-            .driver_launch_action;
+        // Make sure to unregister any other ALVR driver because it would cause a socket conflict
+        let other_alvr_dirs = alvr_server_io::get_registered_drivers()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|path| {
+                path.to_string_lossy().to_lowercase().contains("alvr") && *path != alvr_driver_dir
+            })
+            .collect::<Vec<_>>();
+        alvr_server_io::driver_registration(&other_alvr_dirs, false).ok();
 
-        if !matches!(launch_action, DriverLaunchAction::NoAction) {
-            let other_drivers_paths = if matches!(
-                launch_action,
-                DriverLaunchAction::UnregisterOtherDriversAtStartup
-            ) && data_source.session().drivers_backup.is_none()
-            {
-                let drivers_paths = alvr_server_io::get_registered_drivers().unwrap_or_default();
+        alvr_server_io::driver_registration(&[alvr_driver_dir], true).ok();
 
-                alvr_server_io::driver_registration(&drivers_paths, false).ok();
-
-                drivers_paths
-            } else {
-                vec![]
-            };
-            let alvr_driver_dir =
-                afs::filesystem_layout_from_dashboard_exe(&env::current_exe().unwrap())
-                    .openvr_driver_root_dir;
-
-            alvr_server_io::driver_registration(&[alvr_driver_dir.clone()], true).ok();
-
-            data_source.session_mut().drivers_backup = Some(DriversBackup {
-                alvr_path: alvr_driver_dir,
-                other_paths: other_drivers_paths,
-            });
+        if let Err(err) = unblock_alvr_driver() {
+            warn!("Failed to unblock ALVR driver: {:?}", err);
         }
 
         #[cfg(target_os = "linux")]

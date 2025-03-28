@@ -4,7 +4,6 @@ use alvr_packets::ServerRequest;
 use alvr_server_io::ServerSessionManager;
 use eframe::egui;
 use std::{
-    env,
     io::ErrorKind,
     net::{SocketAddr, TcpStream},
     str::FromStr,
@@ -25,10 +24,7 @@ enum SessionSource {
 }
 
 pub fn get_local_session_source() -> ServerSessionManager {
-    let session_file_path =
-        alvr_filesystem::filesystem_layout_from_dashboard_exe(&env::current_exe().unwrap())
-            .session();
-
+    let session_file_path = crate::get_filesystem_layout().session();
     ServerSessionManager::new(Some(session_file_path))
 }
 
@@ -82,6 +78,8 @@ impl DataSources {
         events_sender: mpsc::Sender<PolledEvent>,
         events_receiver: mpsc::Receiver<PolledEvent>,
     ) -> Self {
+        let filesystem_layout = crate::get_filesystem_layout();
+
         let running = Arc::new(RelaxedAtomic::new(true));
         let (requests_sender, requests_receiver) = mpsc::channel();
         let server_connected = Arc::new(RelaxedAtomic::new(false));
@@ -97,13 +95,17 @@ impl DataSources {
             let events_sender = events_sender.clone();
             move || {
                 let uri = format!("http://127.0.0.1:{port}/api/dashboard-request");
-                let request_agent = ureq::AgentBuilder::new()
-                    .timeout_connect(REQUEST_TIMEOUT)
-                    .build();
+                let request_agent: ureq::Agent = ureq::Agent::config_builder()
+                    .timeout_global(Some(REQUEST_TIMEOUT))
+                    .build()
+                    .into();
 
                 while running.value() {
                     while let Ok(request) = requests_receiver.try_recv() {
-                        debug!("Dashboard request: {request:?}");
+                        debug!(
+                            "Dashboard request: {}",
+                            serde_json::to_string(&request).unwrap()
+                        );
 
                         if let SessionSource::Local(session_manager) = &mut *session_source.lock() {
                             match request {
@@ -138,7 +140,9 @@ impl DataSources {
                                     }
                                 }
                                 ServerRequest::FirewallRules(action) => {
-                                    if alvr_server_io::firewall_rules(action).is_ok() {
+                                    if alvr_server_io::firewall_rules(action, &filesystem_layout)
+                                        .is_ok()
+                                    {
                                         info!("Setting firewall rules succeeded!");
                                     } else {
                                         error!("Setting firewall rules failed!");
@@ -146,10 +150,7 @@ impl DataSources {
                                 }
                                 ServerRequest::RegisterAlvrDriver => {
                                     let alvr_driver_dir =
-                                        alvr_filesystem::filesystem_layout_from_dashboard_exe(
-                                            &env::current_exe().unwrap(),
-                                        )
-                                        .openvr_driver_root_dir;
+                                        filesystem_layout.openvr_driver_root_dir.clone();
 
                                     alvr_server_io::driver_registration(&[alvr_driver_dir], true)
                                         .ok();
@@ -193,9 +194,10 @@ impl DataSources {
                                 }
                             }
                         } else {
+                            // todo: this should be changed to a GET request, requires removing body
                             request_agent
-                                .get(&uri)
-                                .set("X-ALVR", "true")
+                                .post(&uri)
+                                .header("X-ALVR", "true")
                                 .send_json(&request)
                                 .ok();
                         }
@@ -248,6 +250,7 @@ impl DataSources {
                     while running.value() {
                         match ws.read() {
                             Ok(tungstenite::Message::Text(json_string)) => {
+                                debug!("Server event: {json_string}");
                                 if let Ok(event) = serde_json::from_str(&json_string) {
                                     events_sender
                                         .send(PolledEvent {
@@ -285,17 +288,20 @@ impl DataSources {
                 let mut deadline = Instant::now();
                 let uri = format!("http://127.0.0.1:{port}/api/version");
 
-                let request_agent = ureq::AgentBuilder::new()
-                    .timeout_connect(REQUEST_TIMEOUT)
-                    .build();
+                let request_agent: ureq::Agent = ureq::Agent::config_builder()
+                    .timeout_global(Some(REQUEST_TIMEOUT))
+                    .build()
+                    .into();
 
                 loop {
                     let maybe_server_version = request_agent
                         .get(&uri)
-                        .set("X-ALVR", "true")
+                        .header("X-ALVR", "true")
                         .call()
                         .ok()
-                        .and_then(|r| Version::from_str(&r.into_string().ok()?).ok());
+                        .and_then(|r| {
+                            Version::from_str(&r.into_body().read_to_string().ok()?).ok()
+                        });
 
                     let connected = if let Some(version) = maybe_server_version {
                         // We need exact match because we don't do session extrapolation at the

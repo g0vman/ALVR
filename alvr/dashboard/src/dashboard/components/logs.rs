@@ -3,11 +3,11 @@ use alvr_events::{Event, EventType};
 use alvr_gui_common::theme::log_colors;
 use alvr_session::{RawEventsConfig, Settings};
 use eframe::{
-    egui::{Grid, OpenUrl, RichText, ScrollArea, Ui},
+    egui::{Grid, OpenUrl, OutputCommand, RichText, ScrollArea, Ui},
     epaint::Color32,
 };
 use settings_schema::Switch;
-use std::{collections::VecDeque, env};
+use std::collections::VecDeque;
 
 struct Entry {
     color: Color32,
@@ -76,24 +76,26 @@ impl LogsTab {
         ui.horizontal(|ui| {
             if ui.button("Copy all").clicked() {
                 ui.output_mut(|out| {
-                    out.copied_text = self.entries.iter().fold(String::new(), |acc, entry| {
-                        format!(
-                            "{}{} [{}] {}\n",
-                            acc, entry.timestamp, entry.ty, entry.message
-                        )
-                    })
+                    out.commands
+                        .push(OutputCommand::CopyText(self.entries.iter().fold(
+                            String::new(),
+                            |acc, entry| {
+                                format!(
+                                    "{}{} [{}] {}\n",
+                                    acc, entry.timestamp, entry.ty, entry.message
+                                )
+                            },
+                        )));
                 })
             }
             if ui.button("Open logs directory").clicked() {
-                let log_dir = alvr_filesystem::filesystem_layout_from_dashboard_exe(
-                    &env::current_exe().unwrap(),
-                )
-                .log_dir;
-                ui.output_mut(|f| {
-                    f.open_url = Some(OpenUrl::same_tab(format!(
-                        "file://{}",
-                        log_dir.to_string_lossy()
-                    )))
+                let log_dir = crate::get_filesystem_layout().log_dir;
+                ui.output_mut(|out| {
+                    out.commands
+                        .push(OutputCommand::OpenUrl(OpenUrl::same_tab(format!(
+                            "file://{}",
+                            log_dir.to_string_lossy()
+                        ))));
                 });
             }
         });
